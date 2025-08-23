@@ -1,0 +1,45 @@
+# Rust 编译输出
+/target/
+**/*.rs.bk
+
+# Cargo 锁定文件（对于库项目通常不提交，但对于二进制项目建议提交）
+# Cargo.lock
+
+# IDE 和编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 测试证书文件（运行时生成）
+cert.pem
+key.pem
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# 环境变量文件
+.env
+.env.local
+.env.*.local
+
+# 性能分析文件
+*.prof
+perf.data*
+
+# 文档构建输出
+/doc/

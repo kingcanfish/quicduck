@@ -1,0 +1,226 @@
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use anyhow::{anyhow, Result};
+use quiche::{Connection, ConnectionId};
+use ring::rand::SecureRandom;
+use tokio::net::UdpSocket;
+use tokio::time::sleep;
+
+use quicduck::{config, create_simple_config};
+
+/// 简单的 QUIC 客户端
+pub struct SimpleQuicClient {
+    socket: UdpSocket,
+    conn: Connection,
+    server_addr: SocketAddr,
+    next_stream_id: u64, // 追踪下一个可用的流ID
+}
+
+impl SimpleQuicClient {
+    /// 创建新的 QUIC 客户端
+    pub async fn new(server_addr: SocketAddr) -> Result<Self> {
+        // 绑定本地 UDP 套接字
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let local_addr = socket.local_addr()?;
+        println!("🔗 客户端本地地址: {}", local_addr);
+
+        // 生成连接 ID
+        let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+        ring::rand::SystemRandom::new().fill(&mut scid).unwrap();
+        let scid = ConnectionId::from_ref(&scid);
+
+        // 创建客户端配置
+        let mut config = create_simple_config()?;
+        config.verify_peer(false); // 关闭证书验证（仅用于测试）
+
+        // 建立连接
+        let conn = quiche::connect(None, &scid, local_addr, server_addr, &mut config)?;
+        println!("📡 正在连接到服务器 {}", server_addr);
+
+        Ok(Self {
+            socket,
+            conn,
+            server_addr,
+            next_stream_id: 4, // 从流ID 4开始（客户端发起的双向流）
+        })
+    }
+
+    /// 完成握手过程
+    pub async fn handshake(&mut self) -> Result<()> {
+        let mut buf = [0; config::MAX_DATAGRAM_SIZE];
+        let mut out = [0; config::MAX_DATAGRAM_SIZE];
+
+        // 发送初始数据包
+        let (write, send_info) = self.conn.send(&mut out)?;
+        self.socket.send_to(&out[..write], send_info.to).await?;
+        println!("📤 发送初始握手包");
+
+        // 等待握手完成
+        let mut attempts = 0;
+        while !self.conn.is_established() && attempts < 10 {
+            attempts += 1;
+
+            // 接收响应
+            match tokio::time::timeout(Duration::from_secs(1), self.socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, from))) => {
+                    if from != self.server_addr {
+                        continue;
+                    }
+
+                    // 处理接收到的数据包
+                    self.conn.recv(&mut buf[..len], quiche::RecvInfo {
+                        to: self.socket.local_addr()?,
+                        from,
+                    })?;
+
+                    // 发送待发送的数据包
+                    self.send_pending_packets(&mut out).await?;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    // 超时，重试发送
+                    self.send_pending_packets(&mut out).await?;
+                }
+            }
+        }
+
+        if !self.conn.is_established() {
+            return Err(anyhow!("握手失败"));
+        }
+
+        println!("✅ 连接已建立!");
+        Ok(())
+    }
+
+    /// 发送消息
+    pub async fn send_message(&mut self, message: &str) -> Result<()> {
+        if !self.conn.is_established() {
+            return Err(anyhow!("连接未建立"));
+        }
+
+        // 使用新的流ID发送消息，每个消息使用独立的流
+        let stream_id = self.next_stream_id;
+        self.next_stream_id += 4; // 下一个客户端发起的双向流ID（间隔4）
+        
+        self.conn.stream_send(stream_id, message.as_bytes(), true)?;
+        println!("📤 发送消息到流 {} ({} 字节，fin=true): \"{}\"", stream_id, message.len(), message);
+
+        // 发送数据包
+        let mut out = [0; config::MAX_DATAGRAM_SIZE];
+        self.send_pending_packets(&mut out).await?;
+
+        Ok(())
+    }
+
+    /// 接收响应
+    pub async fn receive_response(&mut self) -> Result<String> {
+        let mut buf = [0; config::MAX_DATAGRAM_SIZE];
+        let mut out = [0; config::MAX_DATAGRAM_SIZE];
+
+        // 等待响应
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, from))) => {
+                    if from != self.server_addr {
+                        continue;
+                    }
+
+                    // 处理数据包
+                    self.conn.recv(&mut buf[..len], quiche::RecvInfo {
+                        to: self.socket.local_addr()?,
+                        from,
+                    })?;
+
+                    // 检查可读的流
+                    for stream_id in self.conn.readable() {
+                        // 完整读取流数据，不截断
+                        let mut complete_response = Vec::new();
+                        let mut total_len = 0;
+                        
+                        loop {
+                            let mut stream_buf = vec![0; 1024];
+                            match self.conn.stream_recv(stream_id, &mut stream_buf) {
+                                Ok((len, fin)) => {
+                                    if len > 0 {
+                                        complete_response.extend_from_slice(&stream_buf[..len]);
+                                        total_len += len;
+                                        println!("📥 读取了 {} 字节，fin: {}, 总计: {} 字节", len, fin, total_len);
+                                    }
+                                    
+                                    // 如果收到 fin 标志，说明数据传输完成
+                                    if fin {
+                                        let response = String::from_utf8_lossy(&complete_response).to_string();
+                                        println!("📨 收到完整响应 ({} 字节): \"{}\"", total_len, response);
+                                        return Ok(response);
+                                    }
+                                    
+                                    // 如果没有数据且没有 fin，继续等待
+                                    if len == 0 {
+                                        break;
+                                    }
+                                }
+                                Err(quiche::Error::Done) => break,
+                                Err(e) => return Err(anyhow!("读取流失败: {}", e)),
+                            }
+                        }
+                        
+                        // 如果读取到了数据但没有fin标志，也返回当前数据
+                        if !complete_response.is_empty() {
+                            let response = String::from_utf8_lossy(&complete_response).to_string();
+                            println!("📨 收到部分响应 ({} 字节): \"{}\"", total_len, response);
+                            return Ok(response);
+                        }
+                    }
+
+                    // 发送待发送的数据包
+                    self.send_pending_packets(&mut out).await?;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Err(anyhow!("接收响应超时")),
+            }
+        }
+    }
+
+    /// 发送待发送的数据包
+    async fn send_pending_packets(&mut self, out: &mut [u8]) -> Result<()> {
+        loop {
+            let (write, send_info) = match self.conn.send(out) {
+                Ok(v) => v,
+                Err(quiche::Error::Done) => break,
+                Err(e) => return Err(anyhow!("发送失败: {}", e)),
+            };
+
+            self.socket.send_to(&out[..write], send_info.to).await?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    println!("🦆 QUIC Duck 客户端启动中...");
+
+    let server_addr: SocketAddr = "127.0.0.1:8080".parse()?;
+    let mut client = SimpleQuicClient::new(server_addr).await?;
+    
+    // 完成握手
+    client.handshake().await?;
+
+    // 发送几条测试消息
+    let messages = vec!["Hello QUIC!", "This is a test", "QUIC is fast!"];
+    
+    for msg in messages {
+        client.send_message(msg).await?;
+        match client.receive_response().await {
+            Ok(response) => println!("✅ 成功: {}", response),
+            Err(e) => eprintln!("❌ 错误: {}", e),
+        }
+        
+        // 等待一秒
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    println!("🎉 测试完成!");
+    Ok(())
+}
