@@ -23,7 +23,7 @@ impl SimpleQuicClient {
         // 绑定本地 UDP 套接字
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let local_addr = socket.local_addr()?;
-        println!("🔗 客户端本地地址: {}", local_addr);
+        println!("🔗 客户端本地地址: {local_addr}");
 
         // 生成连接 ID
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
@@ -36,7 +36,7 @@ impl SimpleQuicClient {
 
         // 建立连接
         let conn = quiche::connect(None, &scid, local_addr, server_addr, &mut config)?;
-        println!("📡 正在连接到服务器 {}", server_addr);
+        println!("📡 正在连接到服务器 {server_addr}");
 
         Ok(Self {
             socket,
@@ -104,7 +104,7 @@ impl SimpleQuicClient {
         self.next_stream_id += 4; // 下一个客户端发起的双向流ID（间隔4）
         
         self.conn.stream_send(stream_id, message.as_bytes(), true)?;
-        println!("📤 发送消息到流 {} ({} 字节，fin=true): \"{}\"", stream_id, message.len(), message);
+        println!("📤 发送消息到流 {stream_id} ({} 字节，fin=true): \"{message}\"", message.len());
 
         // 发送数据包
         let mut out = [0; config::MAX_DATAGRAM_SIZE];
@@ -145,13 +145,13 @@ impl SimpleQuicClient {
                                     if len > 0 {
                                         complete_response.extend_from_slice(&stream_buf[..len]);
                                         total_len += len;
-                                        println!("📥 读取了 {} 字节，fin: {}, 总计: {} 字节", len, fin, total_len);
+                                        println!("📥 读取了 {len} 字节，fin: {fin}, 总计: {total_len} 字节");
                                     }
                                     
                                     // 如果收到 fin 标志，说明数据传输完成
                                     if fin {
                                         let response = String::from_utf8_lossy(&complete_response).to_string();
-                                        println!("📨 收到完整响应 ({} 字节): \"{}\"", total_len, response);
+                                        println!("📨 收到完整响应 ({total_len} 字节): \"{response}\"");
                                         return Ok(response);
                                     }
                                     
@@ -161,14 +161,14 @@ impl SimpleQuicClient {
                                     }
                                 }
                                 Err(quiche::Error::Done) => break,
-                                Err(e) => return Err(anyhow!("读取流失败: {}", e)),
+                                Err(e) => return Err(anyhow!("读取流失败: {e}")),
                             }
                         }
                         
                         // 如果读取到了数据但没有fin标志，也返回当前数据
                         if !complete_response.is_empty() {
                             let response = String::from_utf8_lossy(&complete_response).to_string();
-                            println!("📨 收到部分响应 ({} 字节): \"{}\"", total_len, response);
+                            println!("📨 收到部分响应 ({total_len} 字节): \"{response}\"");
                             return Ok(response);
                         }
                     }
@@ -188,7 +188,7 @@ impl SimpleQuicClient {
             let (write, send_info) = match self.conn.send(out) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
-                Err(e) => return Err(anyhow!("发送失败: {}", e)),
+                Err(e) => return Err(anyhow!("发送失败: {e}")),
             };
 
             self.socket.send_to(&out[..write], send_info.to).await?;
@@ -213,8 +213,8 @@ async fn main() -> Result<()> {
     for msg in messages {
         client.send_message(msg).await?;
         match client.receive_response().await {
-            Ok(response) => println!("✅ 成功: {}", response),
-            Err(e) => eprintln!("❌ 错误: {}", e),
+            Ok(response) => println!("✅ 成功: {response}"),
+            Err(e) => eprintln!("❌ 错误: {e}"),
         }
         
         // 等待一秒

@@ -19,7 +19,7 @@ impl SimpleQuicServer {
     /// 创建新的 QUIC 服务器
     pub async fn new(addr: &str) -> Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        println!("🦆 QUIC 服务器启动在: {}", socket.local_addr()?);
+        println!("🦆 QUIC 服务器启动在: {addr}");
 
         Ok(Self {
             socket,
@@ -35,11 +35,11 @@ impl SimpleQuicServer {
         loop {
             // 接收数据包
             let (len, from) = self.socket.recv_from(&mut buf).await?;
-            println!("📦 收到来自 {} 的 {} 字节数据", from, len);
+            println!("📦 收到来自 {from} 的 {len} 字节数据");
 
             // 处理数据包
             if let Err(e) = self.handle_packet(&buf[..len], from, &mut out).await {
-                eprintln!("❌ 处理数据包失败: {}", e);
+                eprintln!("❌ 处理数据包失败: {e}");
             }
         }
     }
@@ -48,14 +48,14 @@ impl SimpleQuicServer {
     async fn handle_packet(&self, pkt: &[u8], from: SocketAddr, out: &mut [u8]) -> Result<()> {
         // 解析数据包头获取连接ID
         let hdr = quiche::Header::from_slice(&mut pkt.to_vec(), quiche::MAX_CONN_ID_LEN)
-            .map_err(|e| anyhow!("解析数据包头失败: {}", e))?;
+            .map_err(|e| anyhow!("解析数据包头失败: {e}"))?;
 
         // 简化连接管理：使用客户端地址作为连接标识符
         // 这样避免了复杂的连接ID映射问题
         let conn_key = format!("{}:{}", from.ip(), from.port());
 
-        println!("📦 收到数据包类型: {:?}, scid: {:?}, dcid: {:?}, 来自: {}", 
-                 hdr.ty, hdr.scid, hdr.dcid, from);
+        println!("📦 收到数据包类型: {:?}, scid: {:?}, dcid: {:?}, 来自: {from}", 
+                 hdr.ty, hdr.scid, hdr.dcid);
 
         // 获取或创建连接
         let mut connections = self.connections.lock().await;
@@ -64,7 +64,7 @@ impl SimpleQuicServer {
             // 新连接 - 只处理 Initial 类型的数据包
             match hdr.ty {
                 quiche::Type::Initial => {
-                    println!("🆕 处理新的 Initial 连接来自: {}", conn_key);
+                    println!("🆕 处理新的 Initial 连接来自: {conn_key}");
                 },
                 _ => {
                     println!("⚠️ 忽略非 Initial 类型的新连接数据包: {:?}", hdr.ty);
@@ -85,14 +85,14 @@ impl SimpleQuicServer {
                                    self.socket.local_addr()?, from, &mut config)?;
             
             connections.insert(conn_key.clone(), conn);
-            println!("🔗 新连接建立: {} <- {}", conn_key, from);
+            println!("🔗 新连接建立: {conn_key} <- {from}");
         }
 
         // 获取连接并处理数据包
         let conn = match connections.get_mut(&conn_key) {
             Some(conn) => conn,
             None => {
-                println!("⚠️ 找不到连接: {}，可能连接已关闭", conn_key);
+                println!("⚠️ 找不到连接: {conn_key}，可能连接已关闭");
                 return Ok(());
             }
         };
@@ -117,27 +117,26 @@ impl SimpleQuicServer {
                             if len > 0 {
                                 complete_message.extend_from_slice(&stream_buf[..len]);
                                 total_len += len;
-                                println!("📥 从流 {} 读取了 {} 字节，fin: {}, 总计: {} 字节", 
-                                        stream_id, len, fin, total_len);
+                                println!("📥 从流 {stream_id} 读取了 {len} 字节，fin: {fin}, 总计: {total_len} 字节");
                             }
                             
                             // 如果收到 fin 标志或没有更多数据，处理完整消息
                             if fin || len == 0 {
                                 if !complete_message.is_empty() {
                                     let msg = String::from_utf8_lossy(&complete_message);
-                                    println!("📨 收到完整消息 ({} 字节): \"{}\"", total_len, msg);
+                                    println!("📨 收到完整消息 ({total_len} 字节): \"{msg}\"");
                                     
                                     // 发送回应，设置 fin=true 表示响应发送完毕
-                                    let response = format!("Echo: {}", msg);
+                                    let response = format!("Echo: {msg}");
                                     conn.stream_send(stream_id, response.as_bytes(), true)?;
-                                    println!("📤 发送回应 ({} 字节，fin=true): \"{}\"", response.len(), response);
+                                    println!("📤 发送回应 ({} 字节，fin=true): \"{response}\"", response.len());
                                 }
                                 break;
                             }
                         }
                         Err(quiche::Error::Done) => break,
                         Err(e) => {
-                            eprintln!("读取流失败: {}", e);
+                            eprintln!("读取流失败: {e}");
                             break;
                         }
                     }
@@ -150,7 +149,7 @@ impl SimpleQuicServer {
             let (write, send_info) = match conn.send(out) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
-                Err(e) => return Err(anyhow!("发送失败: {}", e)),
+                Err(e) => return Err(anyhow!("发送失败: {e}")),
             };
 
             self.socket.send_to(&out[..write], send_info.to).await?;
@@ -158,7 +157,7 @@ impl SimpleQuicServer {
 
         // 检查连接是否关闭，如果关闭则清理连接
         if conn.is_closed() {
-            println!("🚪 连接已关闭，清理连接: {}", conn_key);
+            println!("🚪 连接已关闭，清理连接: {conn_key}");
             connections.remove(&conn_key);
         }
 
