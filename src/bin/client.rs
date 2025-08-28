@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use quiche::{Connection, ConnectionId};
 use ring::rand::SecureRandom;
+use tokio::io::{stdin, AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
-use tokio::time::sleep;
 
 use quicduck::{config, create_simple_config};
 
@@ -15,6 +15,14 @@ pub struct SimpleQuicClient {
     conn: Connection,
     server_addr: SocketAddr,
     next_stream_id: u64, // 追踪下一个可用的流ID
+}
+
+impl SimpleQuicClient {
+    async fn show_prompt(&self) -> Result<()> {
+    print!("-> ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    Ok(())
+}
 }
 
 impl SimpleQuicClient {
@@ -113,7 +121,113 @@ impl SimpleQuicClient {
         Ok(())
     }
 
-    /// 接收响应
+    /// 运行客户端主循环，支持终端输入和实时接收消息
+    pub async fn run_interactive(&mut self) -> Result<()> {
+        println!("🎯 进入交互模式，输入消息后按回车发送，输入 'quit' 退出");
+
+        self.show_prompt().await?;
+
+        let mut stdin_reader = BufReader::new(stdin());
+        let mut buf = [0; config::MAX_DATAGRAM_SIZE];
+        let mut out = [0; config::MAX_DATAGRAM_SIZE];
+        
+        loop {
+            let mut line = String::new();
+            
+            tokio::select! {
+                // 处理终端输入
+                result = stdin_reader.read_line(&mut line) => {
+                    match result {
+                        Ok(_) => {
+                            let message = line.trim();
+                            
+                            if message == "quit" {
+                                println!("👋 再见!");
+                                break;
+                            }
+                            
+                            if !message.is_empty() {
+                                if let Err(e) = self.send_message(message).await {
+                                    eprintln!("❌ 发送消息失败: {e}");
+                                }
+                            }
+                            // 输入处理完后显示新的提示符
+                            self.show_prompt().await?;
+                        }
+                        Err(e) => {
+                            eprintln!("❌ 读取输入失败: {e}");
+                            self.show_prompt().await?;
+                        }
+                    }
+                }
+                
+                // 处理网络接收
+                result = self.socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, from)) => {
+                            if from == self.server_addr {
+                                // 处理数据包
+                                if let Err(e) = self.conn.recv(&mut buf[..len], quiche::RecvInfo {
+                                    to: self.socket.local_addr()?,
+                                    from,
+                                }) {
+                                    eprintln!("❌ 处理数据包失败: {e}");
+                                    continue;
+                                }
+                                
+                                // 检查可读的流并立即打印
+                                for stream_id in self.conn.readable() {
+                                    if let Ok(response) = self.read_stream_data(stream_id) {
+                                        if !response.is_empty() {
+                                            // 清除当前行，显示消息，然后重新显示提示符
+                                            print!("\r📨 收到消息: {response}\n");
+                                            self.show_prompt().await?;
+                                        }
+                                    }
+                                }
+                                
+                                // 发送待发送的数据包
+                                let _ = self.send_pending_packets(&mut out).await;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("❌ 网络接收错误: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 从指定流读取数据
+    fn read_stream_data(&mut self, stream_id: u64) -> Result<String> {
+        let mut complete_response = Vec::new();
+        
+        loop {
+            let mut stream_buf = vec![0; 1024];
+            match self.conn.stream_recv(stream_id, &mut stream_buf) {
+                Ok((len, fin)) => {
+                    if len > 0 {
+                        complete_response.extend_from_slice(&stream_buf[..len]);
+                    }
+                    
+                    if fin || len == 0 {
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => break,
+                Err(e) => return Err(anyhow!("读取流失败: {e}")),
+            }
+        }
+        
+        if !complete_response.is_empty() {
+            Ok(String::from_utf8_lossy(&complete_response).to_string())
+        } else {
+            Ok(String::new())
+        }
+    }
     pub async fn receive_response(&mut self) -> Result<String> {
         let mut buf = [0; config::MAX_DATAGRAM_SIZE];
         let mut out = [0; config::MAX_DATAGRAM_SIZE];
@@ -207,20 +321,7 @@ async fn main() -> Result<()> {
     // 完成握手
     client.handshake().await?;
 
-    // 发送几条测试消息
-    let messages = vec!["Hello QUIC!", "This is a test", "QUIC is fast!"];
-    
-    for msg in messages {
-        client.send_message(msg).await?;
-        match client.receive_response().await {
-            Ok(response) => println!("✅ 成功: {response}"),
-            Err(e) => eprintln!("❌ 错误: {e}"),
-        }
-        
-        // 等待一秒
-        sleep(Duration::from_secs(1)).await;
-    }
-
-    println!("🎉 测试完成!");
+    // 启动交互模式
+    client.run_interactive().await?;
     Ok(())
 }

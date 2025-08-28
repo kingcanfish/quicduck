@@ -12,7 +12,7 @@ name = "client"
 path = "src/bin/client.rs"
 
 [dependencies]
-tokio = { version = "1.0", features = ["net", "rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1.0", features = ["net", "rt-multi-thread", "macros", "time", "sync", "io-util", "io-std"] }
 quiche = "0.21"
 ring = "0.17"
 rcgen = "0.12"
