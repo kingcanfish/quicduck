@@ -4,15 +4,21 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use quiche::Connection;
+use ring::rand::SecureRandom;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
+
+use quiche::ConnectionId;
 
 use quicduck::{config, create_simple_config, generate_cert_and_key};
 
 /// 简单的 QUIC 服务器
 pub struct SimpleQuicServer {
     socket: UdpSocket,
-    connections: Arc<Mutex<HashMap<String, Connection>>>,
+    // 使用ConnectionID作为主键，支持连接迁移
+    connections: Arc<Mutex<HashMap<Vec<u8>, (Connection, SocketAddr)>>>, // (连接对象, 当前客户端地址)
+    // ConnectionID映射表：从scid映射到当前dcid
+    conn_id_mapping: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 }
 
 impl SimpleQuicServer {
@@ -24,6 +30,7 @@ impl SimpleQuicServer {
         Ok(Self {
             socket,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            conn_id_mapping: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -50,58 +57,91 @@ impl SimpleQuicServer {
         let hdr = quiche::Header::from_slice(&mut pkt.to_vec(), quiche::MAX_CONN_ID_LEN)
             .map_err(|e| anyhow!("解析数据包头失败: {e}"))?;
 
-        // 简化连接管理：使用客户端地址作为连接标识符
-        // 这样避免了复杂的连接ID映射问题
-        let conn_key = format!("{}:{}", from.ip(), from.port());
+        println!(
+            "📦 收到数据包类型: {:?}, scid: {:?}, dcid: {:?}, 来自: {from}",
+            hdr.ty, hdr.scid, hdr.dcid
+        );
 
-        println!("📦 收到数据包类型: {:?}, scid: {:?}, dcid: {:?}, 来自: {from}", 
-                 hdr.ty, hdr.scid, hdr.dcid);
-
-        // 获取或创建连接
+        // 查找连接：首先尝试用dcid，如果找不到则检查映射表
         let mut connections = self.connections.lock().await;
-        
-        if !connections.contains_key(&conn_key) {
-            // 新连接 - 只处理 Initial 类型的数据包
+
+        let mut conn_key = hdr.dcid.to_vec();
+
+        // 检查连接是否存在
+        let connection_exists = connections.contains_key(&conn_key);
+
+        if !connection_exists {
+            // 连接不存在 - 只有Initial类型才能创建新连接
             match hdr.ty {
                 quiche::Type::Initial => {
-                    println!("🆕 处理新的 Initial 连接来自: {conn_key}");
-                },
+                    println!(
+                        "🆕 处理新的 Initial 连接,scid: {:?} dcid: {:?}, 来自: {from}",
+                        hdr.scid, hdr.dcid
+                    );
+
+                    // 创建服务器配置
+                    let mut config = create_simple_config()?;
+
+                    // 生成并保存临时证书
+                    ensure_test_cert_exists()?;
+                    config.load_cert_chain_from_pem_file("cert.pem")?;
+                    config.load_priv_key_from_pem_file("key.pem")?;
+
+                    // 创建新连接
+
+                    // 生成连接 ID
+                    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+                    ring::rand::SystemRandom::new().fill(&mut scid).unwrap();
+                    let scid = ConnectionId::from_ref(&scid);
+                    let mut conn =
+                        quiche::accept(&scid, None, self.socket.local_addr()?, from, &mut config)?;
+
+                    // 发送待发送的数据包
+                    loop {
+                        let (write, send_info) = match conn.send(out) {
+                            Ok(v) => v,
+                            Err(quiche::Error::Done) => break,
+                            Err(e) => return Err(anyhow!("发送失败: {e}")),
+                        };
+
+                        self.socket.send_to(&out[..write], send_info.to).await?;
+                    }
+                    conn_key = scid.to_vec();
+                    connections.insert(scid.to_vec(), (conn, from));
+                }
                 _ => {
-                    println!("⚠️ 忽略非 Initial 类型的新连接数据包: {:?}", hdr.ty);
-                    return Ok(());  // 忽略而不是报错
+                    println!(
+                        "⚠️ 找不到连接且非Initial数据包: {:?}, dcid: {:?}",
+                        hdr.ty, hdr.dcid
+                    );
+                    return Ok(());
                 }
             }
-
-            // 创建服务器配置
-            let mut config = create_simple_config()?;
-            
-            // 生成并保存临时证书
-            ensure_test_cert_exists()?;
-            config.load_cert_chain_from_pem_file("cert.pem")?;
-            config.load_priv_key_from_pem_file("key.pem")?;
-            
-            // 创建新连接
-            let conn = quiche::accept(&hdr.scid, Some(&hdr.dcid), 
-                                   self.socket.local_addr()?, from, &mut config)?;
-            
-            connections.insert(conn_key.clone(), conn);
-            println!("🔗 新连接建立: {conn_key} <- {from}");
         }
 
-        // 获取连接并处理数据包
-        let conn = match connections.get_mut(&conn_key) {
-            Some(conn) => conn,
+        // 获取连接并更新客户端地址（支持连接迁移）
+        let (conn, _stored_addr) = match connections.get_mut(&conn_key) {
+            Some((conn, addr)) => {
+                if *addr != from {
+                    println!("🚀 检测到连接迁移: {addr} -> {from}");
+                    *addr = from;
+                }
+                (conn, *addr)
+            }
             None => {
-                println!("⚠️ 找不到连接: {conn_key}，可能连接已关闭");
+                println!("⚠️ 找不到连接: dcid={conn_key:?}，可能连接已关闭");
                 return Ok(());
             }
         };
-        
+
         // 接收数据包
-        conn.recv(&mut pkt.to_vec(), quiche::RecvInfo {
-            to: self.socket.local_addr()?,
-            from,
-        })?;
+        conn.recv(
+            &mut pkt.to_vec(),
+            quiche::RecvInfo {
+                to: self.socket.local_addr()?,
+                from,
+            },
+        )?;
 
         // 处理可读的流
         if conn.is_established() {
@@ -109,7 +149,7 @@ impl SimpleQuicServer {
                 // 完整读取客户端消息，不截断
                 let mut complete_message = Vec::new();
                 let mut total_len = 0;
-                
+
                 loop {
                     let mut stream_buf = vec![0; 1024];
                     match conn.stream_recv(stream_id, &mut stream_buf) {
@@ -119,17 +159,20 @@ impl SimpleQuicServer {
                                 total_len += len;
                                 println!("📥 从流 {stream_id} 读取了 {len} 字节，fin: {fin}, 总计: {total_len} 字节");
                             }
-                            
+
                             // 如果收到 fin 标志或没有更多数据，处理完整消息
                             if fin || len == 0 {
                                 if !complete_message.is_empty() {
                                     let msg = String::from_utf8_lossy(&complete_message);
                                     println!("📨 收到完整消息 ({total_len} 字节): \"{msg}\"");
-                                    
+
                                     // 发送回应，设置 fin=true 表示响应发送完毕
                                     let response = format!("Echo: {msg}");
                                     conn.stream_send(stream_id, response.as_bytes(), true)?;
-                                    println!("📤 发送回应 ({} 字节，fin=true): \"{response}\"", response.len());
+                                    println!(
+                                        "📤 发送回应 ({} 字节，fin=true): \"{response}\"",
+                                        response.len()
+                                    );
                                 }
                                 break;
                             }
@@ -157,8 +200,11 @@ impl SimpleQuicServer {
 
         // 检查连接是否关闭，如果关闭则清理连接
         if conn.is_closed() {
-            println!("🚪 连接已关闭，清理连接: {conn_key}");
+            println!("🚪 连接已关闭，清理连接: dcid={conn_key:?}");
             connections.remove(&conn_key);
+            // 同时清理映射表中相关的条目
+            let mut conn_id_mapping = self.conn_id_mapping.lock().await;
+            conn_id_mapping.retain(|_, dcid| dcid != &conn_key);
         }
 
         Ok(())
@@ -179,7 +225,7 @@ fn generate_test_cert() -> Result<()> {
     use std::io::Write;
 
     println!("🔐 正在生成测试证书...");
-    
+
     // 使用 rcgen 库生成证书和私钥
     let (cert_pem, key_pem) = generate_cert_and_key()?;
 

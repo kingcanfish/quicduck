@@ -19,10 +19,10 @@ pub struct SimpleQuicClient {
 
 impl SimpleQuicClient {
     async fn show_prompt(&self) -> Result<()> {
-    print!("-> ");
-    std::io::Write::flush(&mut std::io::stdout())?;
-    Ok(())
-}
+        print!("-> ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        Ok(())
+    }
 }
 
 impl SimpleQuicClient {
@@ -70,17 +70,22 @@ impl SimpleQuicClient {
             attempts += 1;
 
             // 接收响应
-            match tokio::time::timeout(Duration::from_secs(1), self.socket.recv_from(&mut buf)).await {
+            match tokio::time::timeout(Duration::from_secs(1), self.socket.recv_from(&mut buf))
+                .await
+            {
                 Ok(Ok((len, from))) => {
                     if from != self.server_addr {
                         continue;
                     }
 
                     // 处理接收到的数据包
-                    self.conn.recv(&mut buf[..len], quiche::RecvInfo {
-                        to: self.socket.local_addr()?,
-                        from,
-                    })?;
+                    self.conn.recv(
+                        &mut buf[..len],
+                        quiche::RecvInfo {
+                            to: self.socket.local_addr()?,
+                            from,
+                        },
+                    )?;
 
                     // 发送待发送的数据包
                     self.send_pending_packets(&mut out).await?;
@@ -110,9 +115,12 @@ impl SimpleQuicClient {
         // 使用新的流ID发送消息，每个消息使用独立的流
         let stream_id = self.next_stream_id;
         self.next_stream_id += 4; // 下一个客户端发起的双向流ID（间隔4）
-        
+
         self.conn.stream_send(stream_id, message.as_bytes(), true)?;
-        println!("📤 发送消息到流 {stream_id} ({} 字节，fin=true): \"{message}\"", message.len());
+        println!(
+            "📤 发送消息到流 {stream_id} ({} 字节，fin=true): \"{message}\"",
+            message.len()
+        );
 
         // 发送数据包
         let mut out = [0; config::MAX_DATAGRAM_SIZE];
@@ -130,22 +138,22 @@ impl SimpleQuicClient {
         let mut stdin_reader = BufReader::new(stdin());
         let mut buf = [0; config::MAX_DATAGRAM_SIZE];
         let mut out = [0; config::MAX_DATAGRAM_SIZE];
-        
+
         loop {
             let mut line = String::new();
-            
+
             tokio::select! {
                 // 处理终端输入
                 result = stdin_reader.read_line(&mut line) => {
                     match result {
                         Ok(_) => {
                             let message = line.trim();
-                            
+
                             if message == "quit" {
                                 println!("👋 再见!");
                                 break;
                             }
-                            
+
                             if !message.is_empty() {
                                 if let Err(e) = self.send_message(message).await {
                                     eprintln!("❌ 发送消息失败: {e}");
@@ -160,7 +168,7 @@ impl SimpleQuicClient {
                         }
                     }
                 }
-                
+
                 // 处理网络接收
                 result = self.socket.recv_from(&mut buf) => {
                     match result {
@@ -174,7 +182,7 @@ impl SimpleQuicClient {
                                     eprintln!("❌ 处理数据包失败: {e}");
                                     continue;
                                 }
-                                
+
                                 // 检查可读的流并立即打印
                                 for stream_id in self.conn.readable() {
                                     if let Ok(response) = self.read_stream_data(stream_id) {
@@ -185,7 +193,7 @@ impl SimpleQuicClient {
                                         }
                                     }
                                 }
-                                
+
                                 // 发送待发送的数据包
                                 let _ = self.send_pending_packets(&mut out).await;
                             }
@@ -197,14 +205,14 @@ impl SimpleQuicClient {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// 从指定流读取数据
     fn read_stream_data(&mut self, stream_id: u64) -> Result<String> {
         let mut complete_response = Vec::new();
-        
+
         loop {
             let mut stream_buf = vec![0; 1024];
             match self.conn.stream_recv(stream_id, &mut stream_buf) {
@@ -212,7 +220,7 @@ impl SimpleQuicClient {
                     if len > 0 {
                         complete_response.extend_from_slice(&stream_buf[..len]);
                     }
-                    
+
                     if fin || len == 0 {
                         break;
                     }
@@ -221,7 +229,7 @@ impl SimpleQuicClient {
                 Err(e) => return Err(anyhow!("读取流失败: {e}")),
             }
         }
-        
+
         if !complete_response.is_empty() {
             Ok(String::from_utf8_lossy(&complete_response).to_string())
         } else {
@@ -234,24 +242,29 @@ impl SimpleQuicClient {
 
         // 等待响应
         loop {
-            match tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf)).await {
+            match tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf))
+                .await
+            {
                 Ok(Ok((len, from))) => {
                     if from != self.server_addr {
                         continue;
                     }
 
                     // 处理数据包
-                    self.conn.recv(&mut buf[..len], quiche::RecvInfo {
-                        to: self.socket.local_addr()?,
-                        from,
-                    })?;
+                    self.conn.recv(
+                        &mut buf[..len],
+                        quiche::RecvInfo {
+                            to: self.socket.local_addr()?,
+                            from,
+                        },
+                    )?;
 
                     // 检查可读的流
                     for stream_id in self.conn.readable() {
                         // 完整读取流数据，不截断
                         let mut complete_response = Vec::new();
                         let mut total_len = 0;
-                        
+
                         loop {
                             let mut stream_buf = vec![0; 1024];
                             match self.conn.stream_recv(stream_id, &mut stream_buf) {
@@ -261,14 +274,17 @@ impl SimpleQuicClient {
                                         total_len += len;
                                         println!("📥 读取了 {len} 字节，fin: {fin}, 总计: {total_len} 字节");
                                     }
-                                    
+
                                     // 如果收到 fin 标志，说明数据传输完成
                                     if fin {
-                                        let response = String::from_utf8_lossy(&complete_response).to_string();
-                                        println!("📨 收到完整响应 ({total_len} 字节): \"{response}\"");
+                                        let response =
+                                            String::from_utf8_lossy(&complete_response).to_string();
+                                        println!(
+                                            "📨 收到完整响应 ({total_len} 字节): \"{response}\""
+                                        );
                                         return Ok(response);
                                     }
-                                    
+
                                     // 如果没有数据且没有 fin，继续等待
                                     if len == 0 {
                                         break;
@@ -278,7 +294,7 @@ impl SimpleQuicClient {
                                 Err(e) => return Err(anyhow!("读取流失败: {e}")),
                             }
                         }
-                        
+
                         // 如果读取到了数据但没有fin标志，也返回当前数据
                         if !complete_response.is_empty() {
                             let response = String::from_utf8_lossy(&complete_response).to_string();
@@ -317,7 +333,7 @@ async fn main() -> Result<()> {
 
     let server_addr: SocketAddr = "127.0.0.1:8080".parse()?;
     let mut client = SimpleQuicClient::new(server_addr).await?;
-    
+
     // 完成握手
     client.handshake().await?;
 
