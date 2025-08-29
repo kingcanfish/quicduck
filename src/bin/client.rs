@@ -216,7 +216,7 @@ impl SimpleQuicClient {
     /// 从指定流读取数据
     fn read_stream_data(&mut self, stream_id: u64) -> Result<String> {
         // 获取或创建该流的缓冲区
-        let stream_buffer = self.stream_buffers.entry(stream_id).or_insert_with(Vec::new);
+        let stream_buffer = self.stream_buffers.entry(stream_id).or_default();
 
         loop {
             let mut stream_buf = vec![0; 1024];

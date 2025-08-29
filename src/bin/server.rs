@@ -12,15 +12,29 @@ use quiche::ConnectionId;
 
 use quicduck::{config, create_simple_config, generate_cert_and_key};
 
+/// 连接ID类型
+type ConnId = Vec<u8>;
+
+/// 客户端连接信息：(连接对象, 客户端地址)
+type ClientConnection = (Connection, SocketAddr);
+
+/// 连接映射表：ConnectionID -> 客户端连接信息
+type ConnectionMap = Arc<Mutex<HashMap<ConnId, ClientConnection>>>;
+
+
+/// 流缓冲区：流ID -> 缓冲区数据
+type StreamBuffer = HashMap<u64, Vec<u8>>;
+
+/// 流数据缓冲区：连接ID -> 流缓冲区
+type StreamBuffers = Arc<Mutex<HashMap<ConnId, StreamBuffer>>>;
+
 /// 简单的 QUIC 服务器
 pub struct SimpleQuicServer {
     socket: UdpSocket,
     // 使用ConnectionID作为主键，支持连接迁移
-    connections: Arc<Mutex<HashMap<Vec<u8>, (Connection, SocketAddr)>>>, // (连接对象, 当前客户端地址)
-    // ConnectionID映射表：从scid映射到当前dcid
-    conn_id_mapping: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+    connections: ConnectionMap,
     // 存储每个连接的流数据缓冲区：连接ID -> (流ID -> 缓冲区数据)
-    stream_buffers: Arc<Mutex<HashMap<Vec<u8>, HashMap<u64, Vec<u8>>>>>,
+    stream_buffers: StreamBuffers,
 }
 
 impl SimpleQuicServer {
@@ -32,7 +46,6 @@ impl SimpleQuicServer {
         Ok(Self {
             socket,
             connections: Arc::new(Mutex::new(HashMap::new())),
-            conn_id_mapping: Arc::new(Mutex::new(HashMap::new())),
             stream_buffers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -149,11 +162,11 @@ impl SimpleQuicServer {
         // 处理可读的流
         if conn.is_established() {
             let mut stream_buffers = self.stream_buffers.lock().await;
-            let conn_stream_buffers = stream_buffers.entry(conn_key.clone()).or_insert_with(HashMap::new);
+            let conn_stream_buffers = stream_buffers.entry(conn_key.clone()).or_default();
             
             for stream_id in conn.readable() {
                 // 获取或创建该流的缓冲区
-                let stream_buffer = conn_stream_buffers.entry(stream_id).or_insert_with(Vec::new);
+                let stream_buffer = conn_stream_buffers.entry(stream_id).or_default();
                 
                 loop {
                     let mut stream_buf = vec![0; 1024];
@@ -216,9 +229,6 @@ impl SimpleQuicServer {
         if conn.is_closed() {
             println!("🚪 连接已关闭，清理连接: dcid={conn_key:?}");
             connections.remove(&conn_key);
-            // 同时清理映射表中相关的条目
-            let mut conn_id_mapping = self.conn_id_mapping.lock().await;
-            conn_id_mapping.retain(|_, dcid| dcid != &conn_key);
             // 清理流缓冲区
             let mut stream_buffers = self.stream_buffers.lock().await;
             stream_buffers.remove(&conn_key);
