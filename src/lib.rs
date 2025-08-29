@@ -3,12 +3,17 @@ pub mod config {
     pub const MAX_DATAGRAM_SIZE: usize = 1350;
 }
 
-/// 生成自签名证书和私钥（用于测试）
+/// 生成自签名证书和私钥（用于测试），默认使用localhost域名
 pub fn generate_cert_and_key() -> anyhow::Result<(String, String)> {
+    generate_cert_and_key_for_domain("localhost")
+}
+
+/// 生成为指定域名生成自签名证书和私钥
+pub fn generate_cert_and_key_for_domain(domain: &str) -> anyhow::Result<(String, String)> {
     use std::time::{Duration, SystemTime};
 
     // 创建证书参数
-    let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]);
+    let mut params = rcgen::CertificateParams::new(vec![domain.into()]);
     params.not_before = (SystemTime::now() - Duration::from_secs(24 * 3600)).into(); // 1天前
     params.not_after = (SystemTime::now() + Duration::from_secs(365 * 24 * 3600)).into(); // 365天后
     params.serial_number = Some(1_u64.into());

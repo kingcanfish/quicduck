@@ -17,3 +17,4 @@ quiche = "0.21"
 ring = "0.17"
 rcgen = "0.12"
 anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }

@@ -4,13 +4,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use clap::Parser;
 use quiche::{Connection,ConnectionId};
 use ring::rand::SecureRandom;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval};
 
-use quicduck::{config, create_simple_config, generate_cert_and_key};
+use quicduck::{config, create_simple_config, generate_cert_and_key_for_domain};
+
+#[derive(Parser)]
+#[command(name = "quicduck-server")]
+#[command(about = "A simple QUIC echo server supporting custom address and certificate domain")]
+pub struct Args {
+    /// Listen address (IP:PORT)
+    #[arg(short, long, default_value = "127.0.0.1:8080")]
+    pub addr: String,
+
+    /// Certificate domain name
+    #[arg(short = 'd', long, default_value = "localhost")]
+    pub domain: String,
+}
 
 /// UDP数据包结构
 #[derive(Debug)]
@@ -264,7 +278,7 @@ impl SimpleQuicServer {
         let mut config = create_simple_config()?;
         
         // 生成并保存临时证书
-        ensure_test_cert_exists()?;
+        ensure_test_cert_exists("localhost")?;  // 默认使用localhost，因为这是一个运行时调用
         config.load_cert_chain_from_pem_file("cert.pem")?;
         config.load_priv_key_from_pem_file("key.pem")?;
 
@@ -327,22 +341,22 @@ impl SimpleQuicServer {
 }
 
 /// 确保测试证书文件存在
-fn ensure_test_cert_exists() -> Result<()> {
+fn ensure_test_cert_exists(domain: &str) -> Result<()> {
     if std::path::Path::new("cert.pem").exists() && std::path::Path::new("key.pem").exists() {
         return Ok(());
     }
-    generate_test_cert()
+    generate_test_cert_for_domain(domain)
 }
 
 /// 生成测试用的自签名证书
-fn generate_test_cert() -> Result<()> {
+fn generate_test_cert_for_domain(domain: &str) -> Result<()> {
     use std::fs::File;
     use std::io::Write;
 
-    println!("🔐 正在生成测试证书...");
-    
+    println!("🔐 正在生成测试证书针对域名: {domain}...");
+
     // 使用 rcgen 库生成证书和私钥
-    let (cert_pem, key_pem) = generate_cert_and_key()?;
+    let (cert_pem, key_pem) = generate_cert_and_key_for_domain(domain)?;
 
     // 写入证书文件
     let mut cert_file = File::create("cert.pem")?;
@@ -358,11 +372,16 @@ fn generate_test_cert() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 解析命令行参数
+    let args = Args::parse();
+
     println!("🦆 QUIC Duck 服务器启动中...");
+    println!("🔗 监听地址: {}", args.addr);
+    println!("🔐 证书域名: {}", args.domain);
 
     // 确保测试证书存在
-    ensure_test_cert_exists()?;
+    ensure_test_cert_exists(&args.domain)?;
 
-    let server = SimpleQuicServer::new("127.0.0.1:8080").await?;
+    let server = SimpleQuicServer::new(&args.addr).await?;
     server.run().await
 }

@@ -3,12 +3,22 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use clap::Parser;
 use quiche::{Connection, ConnectionId};
 use ring::rand::SecureRandom;
 use tokio::io::{stdin, AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
 
 use quicduck::{config, create_simple_config};
+
+#[derive(Parser)]
+#[command(name = "quicduck-client")]
+#[command(about = "A simple QUIC client supporting custom server address")]
+pub struct Args {
+    /// Server address to connect to (IP:PORT or hostname:PORT)
+    #[arg(short, long, default_value = "127.0.0.1:8080")]
+    pub server: String,
+}
 
 /// 简单的 QUIC 客户端
 pub struct SimpleQuicClient {
@@ -30,7 +40,8 @@ impl SimpleQuicClient {
 
 impl SimpleQuicClient {
     /// 创建新的 QUIC 客户端
-    pub async fn new(server_addr: SocketAddr) -> Result<Self> {
+    pub async fn new(server_addr_str: &str) -> Result<Self> {
+        let server_addr: SocketAddr = server_addr_str.parse()?;
         // 绑定本地 UDP 套接字
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let local_addr = socket.local_addr()?;
@@ -349,10 +360,13 @@ impl SimpleQuicClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("🦆 QUIC Duck 客户端启动中...");
+    // 解析命令行参数
+    let args = Args::parse();
 
-    let server_addr: SocketAddr = "127.0.0.1:8080".parse()?;
-    let mut client = SimpleQuicClient::new(server_addr).await?;
+    println!("🦆 QUIC Duck 客户端启动中...");
+    println!("🏠 连接到服务器: {}", args.server);
+
+    let mut client = SimpleQuicClient::new(&args.server).await?;
 
     // 完成握手
     client.handshake().await?;
