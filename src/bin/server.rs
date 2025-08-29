@@ -19,6 +19,8 @@ pub struct SimpleQuicServer {
     connections: Arc<Mutex<HashMap<Vec<u8>, (Connection, SocketAddr)>>>, // (连接对象, 当前客户端地址)
     // ConnectionID映射表：从scid映射到当前dcid
     conn_id_mapping: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+    // 存储每个连接的流数据缓冲区：连接ID -> (流ID -> 缓冲区数据)
+    stream_buffers: Arc<Mutex<HashMap<Vec<u8>, HashMap<u64, Vec<u8>>>>>,
 }
 
 impl SimpleQuicServer {
@@ -31,6 +33,7 @@ impl SimpleQuicServer {
             socket,
             connections: Arc::new(Mutex::new(HashMap::new())),
             conn_id_mapping: Arc::new(Mutex::new(HashMap::new())),
+            stream_buffers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -145,39 +148,50 @@ impl SimpleQuicServer {
 
         // 处理可读的流
         if conn.is_established() {
+            let mut stream_buffers = self.stream_buffers.lock().await;
+            let conn_stream_buffers = stream_buffers.entry(conn_key.clone()).or_insert_with(HashMap::new);
+            
             for stream_id in conn.readable() {
-                // 完整读取客户端消息，不截断
-                let mut complete_message = Vec::new();
-                let mut total_len = 0;
-
+                // 获取或创建该流的缓冲区
+                let stream_buffer = conn_stream_buffers.entry(stream_id).or_insert_with(Vec::new);
+                
                 loop {
                     let mut stream_buf = vec![0; 1024];
                     match conn.stream_recv(stream_id, &mut stream_buf) {
                         Ok((len, fin)) => {
                             if len > 0 {
-                                complete_message.extend_from_slice(&stream_buf[..len]);
-                                total_len += len;
-                                println!("📥 从流 {stream_id} 读取了 {len} 字节，fin: {fin}, 总计: {total_len} 字节");
+                                stream_buffer.extend_from_slice(&stream_buf[..len]);
+                                println!("📥 从流 {stream_id} 读取了 {len} 字节，fin: {fin}, 缓冲区总计: {} 字节", stream_buffer.len());
                             }
-
-                            // 如果收到 fin 标志或没有更多数据，处理完整消息
-                            if fin || len == 0 {
-                                if !complete_message.is_empty() {
-                                    let msg = String::from_utf8_lossy(&complete_message);
-                                    println!("📨 收到完整消息 ({total_len} 字节): \"{msg}\"");
-
+                            
+                            // 如果收到 fin 标志，处理完整消息
+                            if fin {
+                                if !stream_buffer.is_empty() {
+                                    let msg = String::from_utf8_lossy(stream_buffer);
+                                    println!("📨 收到完整消息 ({} 字节): \"{msg}\"", stream_buffer.len());
+                                    
                                     // 发送回应，设置 fin=true 表示响应发送完毕
                                     let response = format!("Echo: {msg}");
                                     conn.stream_send(stream_id, response.as_bytes(), true)?;
-                                    println!(
-                                        "📤 发送回应 ({} 字节，fin=true): \"{response}\"",
-                                        response.len()
-                                    );
+                                    println!("📤 发送回应 ({} 字节，fin=true): \"{response}\"", response.len());
+                                    
+                                    // 清理该流的缓冲区
+                                    conn_stream_buffers.remove(&stream_id);
                                 }
                                 break;
                             }
+                            
+                            if len == 0 {
+                                // 没有更多数据但流未结束，保留缓冲区数据
+                                println!("⚠️ 流{stream_id}未结束，等待后续数据");
+                                break;
+                            }
                         }
-                        Err(quiche::Error::Done) => break,
+                        Err(quiche::Error::Done) => {
+                            // 当前没有更多数据可读，保留已读数据等待后续数据
+                            println!("⚠️ 流{stream_id}暂无更多数据，等待后续数据");
+                            break;
+                        }
                         Err(e) => {
                             eprintln!("读取流失败: {e}");
                             break;
@@ -205,6 +219,9 @@ impl SimpleQuicServer {
             // 同时清理映射表中相关的条目
             let mut conn_id_mapping = self.conn_id_mapping.lock().await;
             conn_id_mapping.retain(|_, dcid| dcid != &conn_key);
+            // 清理流缓冲区
+            let mut stream_buffers = self.stream_buffers.lock().await;
+            stream_buffers.remove(&conn_key);
         }
 
         Ok(())

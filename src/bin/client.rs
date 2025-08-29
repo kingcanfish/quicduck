@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ pub struct SimpleQuicClient {
     conn: Connection,
     server_addr: SocketAddr,
     next_stream_id: u64, // 追踪下一个可用的流ID
+    // 存储每个流的部分数据缓冲区
+    stream_buffers: HashMap<u64, Vec<u8>>,
 }
 
 impl SimpleQuicClient {
@@ -51,6 +54,7 @@ impl SimpleQuicClient {
             conn,
             server_addr,
             next_stream_id: 4, // 从流ID 4开始（客户端发起的双向流）
+            stream_buffers: HashMap::new(),
         })
     }
 
@@ -211,30 +215,46 @@ impl SimpleQuicClient {
 
     /// 从指定流读取数据
     fn read_stream_data(&mut self, stream_id: u64) -> Result<String> {
-        let mut complete_response = Vec::new();
+        // 获取或创建该流的缓冲区
+        let stream_buffer = self.stream_buffers.entry(stream_id).or_insert_with(Vec::new);
 
         loop {
             let mut stream_buf = vec![0; 1024];
             match self.conn.stream_recv(stream_id, &mut stream_buf) {
                 Ok((len, fin)) => {
                     if len > 0 {
-                        complete_response.extend_from_slice(&stream_buf[..len]);
+                        stream_buffer.extend_from_slice(&stream_buf[..len]);
                     }
 
-                    if fin || len == 0 {
+                    if fin {
+                        // 流结束，返回完整数据并清理缓冲区
+                        let complete_data = stream_buffer.clone();
+                        self.stream_buffers.remove(&stream_id);
+                        
+                        if !complete_data.is_empty() {
+                            return Ok(String::from_utf8_lossy(&complete_data).to_string());
+                        } else {
+                            return Ok(String::new());
+                        }
+                    }
+                    
+                    if len == 0 {
+                        // 没有更多数据但流未结束，保留缓冲区数据，不返回任何内容
+                        println!("⚠️ 流{stream_id}未结束，等待后续数据");
                         break;
                     }
                 }
-                Err(quiche::Error::Done) => break,
+                Err(quiche::Error::Done) => {
+                    // 当前没有更多数据可读，保留已读数据等待后续数据，不返回任何内容
+                    println!("⚠️ 流{stream_id}未结束，等待后续数据");
+                    break;
+                }
                 Err(e) => return Err(anyhow!("读取流失败: {e}")),
             }
         }
 
-        if !complete_response.is_empty() {
-            Ok(String::from_utf8_lossy(&complete_response).to_string())
-        } else {
-            Ok(String::new())
-        }
+        // 流未结束，返回空字符串等待后续数据
+        Ok(String::new())
     }
     pub async fn receive_response(&mut self) -> Result<String> {
         let mut buf = [0; config::MAX_DATAGRAM_SIZE];
