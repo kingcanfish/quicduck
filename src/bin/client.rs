@@ -6,8 +6,11 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use quiche::{Connection, ConnectionId};
 use ring::rand::SecureRandom;
+use std::io::{self, Write};
 use tokio::io::{stdin, AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
+
+use log::{debug, error, info};
 
 use quicduck::{config, create_simple_config};
 
@@ -32,8 +35,9 @@ pub struct SimpleQuicClient {
 
 impl SimpleQuicClient {
     async fn show_prompt(&self) -> Result<()> {
-        print!("-> ");
-        std::io::Write::flush(&mut std::io::stdout())?;
+        std::io::stdout()
+            .write_all(b"->")
+            .and_then(|_| std::io::stdout().flush())?;
         Ok(())
     }
 }
@@ -45,7 +49,7 @@ impl SimpleQuicClient {
         // 绑定本地 UDP 套接字
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let local_addr = socket.local_addr()?;
-        println!("🔗 客户端本地地址: {local_addr}");
+        info!("🔗 客户端本地地址: {local_addr}");
 
         // 生成连接 ID
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
@@ -58,7 +62,7 @@ impl SimpleQuicClient {
 
         // 建立连接
         let conn = quiche::connect(None, &scid, local_addr, server_addr, &mut config)?;
-        println!("📡 正在连接到服务器 {server_addr}");
+        info!("📡 正在连接到服务器 {server_addr}");
 
         Ok(Self {
             socket,
@@ -77,7 +81,7 @@ impl SimpleQuicClient {
         // 发送初始数据包
         let (write, send_info) = self.conn.send(&mut out)?;
         self.socket.send_to(&out[..write], send_info.to).await?;
-        println!("📤 发送初始握手包");
+        debug!("📤 发送初始握手包");
 
         // 等待握手完成
         let mut attempts = 0;
@@ -117,7 +121,7 @@ impl SimpleQuicClient {
             return Err(anyhow!("握手失败"));
         }
 
-        println!("✅ 连接已建立!");
+        info!("✅ 连接已建立!");
         Ok(())
     }
 
@@ -132,7 +136,7 @@ impl SimpleQuicClient {
         self.next_stream_id += 4; // 下一个客户端发起的双向流ID（间隔4）
 
         self.conn.stream_send(stream_id, message.as_bytes(), true)?;
-        println!(
+        debug!(
             "📤 发送消息到流 {stream_id} ({} 字节，fin=true): \"{message}\"",
             message.len()
         );
@@ -146,7 +150,7 @@ impl SimpleQuicClient {
 
     /// 运行客户端主循环，支持终端输入和实时接收消息
     pub async fn run_interactive(&mut self) -> Result<()> {
-        println!("🎯 进入交互模式，输入消息后按回车发送，输入 'quit' 退出");
+        info!("🎯 进入交互模式，输入消息后按回车发送，输入 'quit' 退出");
 
         self.show_prompt().await?;
 
@@ -165,22 +169,22 @@ impl SimpleQuicClient {
                             let message = line.trim();
 
                             if message == "quit" {
-                                println!("👋 再见!");
+                                info!("👋 再见!");
                                 break;
                             }
 
                             if !message.is_empty() {
                                 if let Err(e) = self.send_message(message).await {
-                                    eprintln!("❌ 发送消息失败: {e}");
+                                    error!("❌ 发送消息失败: {e}");
                                 }
                             }
                             // 输入处理完后显示新的提示符
                             self.show_prompt().await?;
                         }
                         Err(e) => {
-                            eprintln!("❌ 读取输入失败: {e}");
-                            self.show_prompt().await?;
-                        }
+                             error!("❌ 读取输入失败: {e}");
+                             self.show_prompt().await?;
+                         }
                     }
                 }
 
@@ -194,7 +198,7 @@ impl SimpleQuicClient {
                                     to: self.socket.local_addr()?,
                                     from,
                                 }) {
-                                    eprintln!("❌ 处理数据包失败: {e}");
+                                    error!("❌ 处理数据包失败: {e}");
                                     continue;
                                 }
 
@@ -203,7 +207,8 @@ impl SimpleQuicClient {
                                     if let Ok(response) = self.read_stream_data(stream_id) {
                                         if !response.is_empty() {
                                             // 清除当前行，显示消息，然后重新显示提示符
-                                            print!("\r📨 收到消息: {response}\n");
+                                            std::io::stdout().write_all(b"\r").and_then(|_| std::io::stdout().flush())?;
+                                            info!("📨 收到消息: {response}");
                                             self.show_prompt().await?;
                                         }
                                     }
@@ -214,8 +219,8 @@ impl SimpleQuicClient {
                             }
                         }
                         Err(e) => {
-                            eprintln!("❌ 网络接收错误: {e}");
-                        }
+                             error!("❌ 网络接收错误: {e}");
+                         }
                     }
                 }
             }
@@ -241,23 +246,23 @@ impl SimpleQuicClient {
                         // 流结束，返回完整数据并清理缓冲区
                         let complete_data = stream_buffer.clone();
                         self.stream_buffers.remove(&stream_id);
-                        
+
                         if !complete_data.is_empty() {
                             return Ok(String::from_utf8_lossy(&complete_data).to_string());
                         } else {
                             return Ok(String::new());
                         }
                     }
-                    
+
                     if len == 0 {
                         // 没有更多数据但流未结束，保留缓冲区数据，不返回任何内容
-                        println!("⚠️ 流{stream_id}未结束，等待后续数据");
+                        debug!("⚠️ 流{stream_id}未结束，等待后续数据");
                         break;
                     }
                 }
                 Err(quiche::Error::Done) => {
                     // 当前没有更多数据可读，保留已读数据等待后续数据，不返回任何内容
-                    println!("⚠️ 流{stream_id}未结束，等待后续数据");
+                    debug!("⚠️ 流{stream_id}未结束，等待后续数据");
                     break;
                 }
                 Err(e) => return Err(anyhow!("读取流失败: {e}")),
@@ -303,16 +308,14 @@ impl SimpleQuicClient {
                                     if len > 0 {
                                         complete_response.extend_from_slice(&stream_buf[..len]);
                                         total_len += len;
-                                        println!("📥 读取了 {len} 字节，fin: {fin}, 总计: {total_len} 字节");
+                                        debug!("📥 读取了 {len} 字节，fin: {fin}, 总计: {total_len} 字节");
                                     }
 
                                     // 如果收到 fin 标志，说明数据传输完成
                                     if fin {
                                         let response =
                                             String::from_utf8_lossy(&complete_response).to_string();
-                                        println!(
-                                            "📨 收到完整响应 ({total_len} 字节): \"{response}\""
-                                        );
+                                        info!("📨 收到完整响应 ({total_len} 字节): \"{response}\"");
                                         return Ok(response);
                                     }
 
@@ -329,7 +332,7 @@ impl SimpleQuicClient {
                         // 如果读取到了数据但没有fin标志，也返回当前数据
                         if !complete_response.is_empty() {
                             let response = String::from_utf8_lossy(&complete_response).to_string();
-                            println!("📨 收到部分响应 ({total_len} 字节): \"{response}\"");
+                            info!("📨 收到部分响应 ({total_len} 字节): \"{response}\"");
                             return Ok(response);
                         }
                     }
@@ -360,11 +363,16 @@ impl SimpleQuicClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 初始化日志系统，使用环境变量RUST_LOG控制日志级别
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+
     // 解析命令行参数
     let args = Args::parse();
 
-    println!("🦆 QUIC Duck 客户端启动中...");
-    println!("🏠 连接到服务器: {}", args.server);
+    info!("🦆 QUIC Duck 客户端启动中...");
+    info!("🏠 连接到服务器: {}", args.server);
 
     let mut client = SimpleQuicClient::new(&args.server).await?;
 
