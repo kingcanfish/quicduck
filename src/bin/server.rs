@@ -173,11 +173,15 @@ impl ConnectionHandler {
 
                         if len == 0 {
                             // 没有更多数据但流未结束，保留缓冲区数据
+                            // 当前没有更多数据可读，保留已读数据等待后续数据，不返回任何内容
+                            debug!("⚠️ 流{stream_id}未结束，等待后续数据");
                             break;
                         }
                     }
                     Err(quiche::Error::Done) => {
                         // 当前没有更多数据可读，保留已读数据等待后续数据
+                        // 当前没有更多数据可读，保留已读数据等待后续数据，不返回任何内容
+                        debug!("⚠️ 流{stream_id}未结束，等待后续数据");
                         break;
                     }
                     Err(e) => {
@@ -397,7 +401,7 @@ fn generate_test_cert_for_domain(domain: &str) -> Result<()> {
 async fn main() -> Result<()> {
     // 初始化日志系统，使用环境变量RUST_LOG控制日志级别
     env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
+        // .filter_level(log::LevelFilter::Info)
         .init();
 
     // 解析命令行参数

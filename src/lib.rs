@@ -32,10 +32,10 @@ pub fn create_simple_config() -> anyhow::Result<quiche::Config> {
     // 设置应用协议
     config.set_application_protos(&[b"quic-demo"])?;
 
-    // 设置基本的流控制参数
-    config.set_initial_max_data(1_000_000);
-    config.set_initial_max_stream_data_bidi_local(100_000);
-    config.set_initial_max_stream_data_bidi_remote(100_000);
+    // 设置基本的流控制参数（增加窗口大小以支持超长文本）
+    config.set_initial_max_data(10_000_000);        // 10MB
+    config.set_initial_max_stream_data_bidi_local(1_000_000);   // 1MB
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);  // 1MB
     config.set_initial_max_streams_bidi(10);
     config.set_initial_max_streams_uni(10);
 

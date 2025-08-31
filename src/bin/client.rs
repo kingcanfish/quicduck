@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use quiche::{Connection, ConnectionId};
 use ring::rand::SecureRandom;
-use std::io::{self, Write};
+use std::io::Write;
 use tokio::io::{stdin, AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
 
@@ -135,16 +135,56 @@ impl SimpleQuicClient {
         let stream_id = self.next_stream_id;
         self.next_stream_id += 4; // 下一个客户端发起的双向流ID（间隔4）
 
-        self.conn.stream_send(stream_id, message.as_bytes(), true)?;
+        let message_bytes = message.as_bytes();
+        let chunk_size = 8192; // 8KB块大小
+        let mut sent = 0;
+
         debug!(
-            "📤 发送消息到流 {stream_id} ({} 字节，fin=true): \"{message}\"",
-            message.len()
+            "📤 开始发送消息到流 {stream_id} (总计 {} 字节): \"{message}\"",
+            message_bytes.len()
         );
 
-        // 发送数据包
-        let mut out = [0; config::MAX_DATAGRAM_SIZE];
-        self.send_pending_packets(&mut out).await?;
+        while sent < message_bytes.len() {
+            let remaining = message_bytes.len() - sent;
+            let chunk_len = std::cmp::min(chunk_size, remaining);
+            let chunk = &message_bytes[sent..sent + chunk_len];
+            let is_last = sent + chunk_len >= message_bytes.len();
 
+            // 循环发送直到成功或出错
+            loop {
+                match self.conn.stream_send(stream_id, chunk, is_last) {
+                    Ok(written) => {
+                        if written == chunk.len() {
+                            debug!("📤 成功发送块 {}/{} 字节到流 {stream_id} (fin={})", 
+                                   sent + written, message_bytes.len(), is_last);
+                            break; // 成功发送完整块
+                        } else {
+                            // 部分发送，等待流控制窗口
+                            debug!("⚠️ 部分发送 {}/{} 字节，等待流控制窗口", written, chunk.len());
+                            let mut out = [0; config::MAX_DATAGRAM_SIZE];
+                            self.send_pending_packets(&mut out).await?;
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                    Err(quiche::Error::Done) => {
+                        // 流控制限制，等待并重试
+                        debug!("⚠️ 流控制限制，等待重试");
+                        let mut out = [0; config::MAX_DATAGRAM_SIZE];
+                        self.send_pending_packets(&mut out).await?;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) => return Err(anyhow!("发送失败: {e}")),
+                }
+            }
+
+            sent += chunk_len;
+
+            // 发送数据包
+            let mut out = [0; config::MAX_DATAGRAM_SIZE];
+            self.send_pending_packets(&mut out).await?;
+        }
+
+        debug!("✅ 完整消息发送完成到流 {stream_id} ({} 字节)", message_bytes.len());
         Ok(())
     }
 
@@ -271,80 +311,7 @@ impl SimpleQuicClient {
 
         // 流未结束，返回空字符串等待后续数据
         Ok(String::new())
-    }
-    pub async fn receive_response(&mut self) -> Result<String> {
-        let mut buf = [0; config::MAX_DATAGRAM_SIZE];
-        let mut out = [0; config::MAX_DATAGRAM_SIZE];
-
-        // 等待响应
-        loop {
-            match tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf))
-                .await
-            {
-                Ok(Ok((len, from))) => {
-                    if from != self.server_addr {
-                        continue;
-                    }
-
-                    // 处理数据包
-                    self.conn.recv(
-                        &mut buf[..len],
-                        quiche::RecvInfo {
-                            to: self.socket.local_addr()?,
-                            from,
-                        },
-                    )?;
-
-                    // 检查可读的流
-                    for stream_id in self.conn.readable() {
-                        // 完整读取流数据，不截断
-                        let mut complete_response = Vec::new();
-                        let mut total_len = 0;
-
-                        loop {
-                            let mut stream_buf = vec![0; 1024];
-                            match self.conn.stream_recv(stream_id, &mut stream_buf) {
-                                Ok((len, fin)) => {
-                                    if len > 0 {
-                                        complete_response.extend_from_slice(&stream_buf[..len]);
-                                        total_len += len;
-                                        debug!("📥 读取了 {len} 字节，fin: {fin}, 总计: {total_len} 字节");
-                                    }
-
-                                    // 如果收到 fin 标志，说明数据传输完成
-                                    if fin {
-                                        let response =
-                                            String::from_utf8_lossy(&complete_response).to_string();
-                                        info!("📨 收到完整响应 ({total_len} 字节): \"{response}\"");
-                                        return Ok(response);
-                                    }
-
-                                    // 如果没有数据且没有 fin，继续等待
-                                    if len == 0 {
-                                        break;
-                                    }
-                                }
-                                Err(quiche::Error::Done) => break,
-                                Err(e) => return Err(anyhow!("读取流失败: {e}")),
-                            }
-                        }
-
-                        // 如果读取到了数据但没有fin标志，也返回当前数据
-                        if !complete_response.is_empty() {
-                            let response = String::from_utf8_lossy(&complete_response).to_string();
-                            info!("📨 收到部分响应 ({total_len} 字节): \"{response}\"");
-                            return Ok(response);
-                        }
-                    }
-
-                    // 发送待发送的数据包
-                    self.send_pending_packets(&mut out).await?;
-                }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_) => return Err(anyhow!("接收响应超时")),
-            }
-        }
-    }
+     }
 
     /// 发送待发送的数据包
     async fn send_pending_packets(&mut self, out: &mut [u8]) -> Result<()> {
@@ -365,7 +332,7 @@ impl SimpleQuicClient {
 async fn main() -> Result<()> {
     // 初始化日志系统，使用环境变量RUST_LOG控制日志级别
     env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
+        // .filter_level(log::LevelFilter::Info)
         .init();
 
     // 解析命令行参数
