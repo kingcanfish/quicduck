@@ -9,7 +9,7 @@ use ring::rand::SecureRandom;
 use std::io::Write;
 use tokio::io::{stdin, AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
-
+use env_logger::Env;
 use log::{debug, error, info, warn};
 
 use quicduck::{config, create_simple_config};
@@ -447,10 +447,8 @@ impl SimpleQuicClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 初始化日志系统，使用环境变量RUST_LOG控制日志级别
-    env_logger::Builder::from_default_env()
-        // .filter_level(log::LevelFilter::Info)
-        .init();
+    // 初始化日志系统，使用环境变量RUST_LOG控制日志级别，默认Info
+    env_logger::init_from_env(Env::default().default_filter_or("info"));
 
     // 解析命令行参数
     let args = Args::parse();
