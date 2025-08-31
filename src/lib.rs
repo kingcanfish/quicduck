@@ -39,8 +39,12 @@ pub fn create_simple_config() -> anyhow::Result<quiche::Config> {
     config.set_initial_max_streams_bidi(10);
     config.set_initial_max_streams_uni(10);
 
-    // 设置超时时间
-    config.set_max_idle_timeout(30_000); // 30 秒
+    // 设置超时时间 - 增加空闲超时时间，QUIC会自动在需要时发送PING帧保活
+    config.set_max_idle_timeout(300_000); // 5分钟 (300秒)
+    
+    // 设置ACK延迟参数，优化网络性能
+    config.set_ack_delay_exponent(3); // 控制ACK延迟的精度
+    config.set_max_ack_delay(25);     // 最大ACK延迟25ms
 
     Ok(config)
 }

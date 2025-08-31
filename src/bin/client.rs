@@ -10,7 +10,7 @@ use std::io::Write;
 use tokio::io::{stdin, AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use quicduck::{config, create_simple_config};
 
@@ -28,9 +28,11 @@ pub struct SimpleQuicClient {
     socket: UdpSocket,
     conn: Connection,
     server_addr: SocketAddr,
+    server_addr_str: String, // 保存服务器地址字符串用于重连
     next_stream_id: u64, // 追踪下一个可用的流ID
     // 存储每个流的部分数据缓冲区
     stream_buffers: HashMap<u64, Vec<u8>>,
+    last_activity: std::time::Instant, // 最后活动时间
 }
 
 impl SimpleQuicClient {
@@ -68,8 +70,10 @@ impl SimpleQuicClient {
             socket,
             conn,
             server_addr,
+            server_addr_str: server_addr_str.to_string(),
             next_stream_id: 4, // 从流ID 4开始（客户端发起的双向流）
             stream_buffers: HashMap::new(),
+            last_activity: std::time::Instant::now(),
         })
     }
 
@@ -125,8 +129,87 @@ impl SimpleQuicClient {
         Ok(())
     }
 
+    /// 检查连接是否仍然有效
+    fn is_connection_alive(&self) -> bool {
+        self.conn.is_established() && !self.conn.is_closed()
+    }
+
+    /// 重新连接到服务器
+    pub async fn reconnect(&mut self) -> Result<()> {
+        info!("🔄 尝试重新连接到服务器 {}", self.server_addr);
+
+        // 重新解析服务器地址（防止DNS变化）
+        self.server_addr = self.server_addr_str.parse()?;
+
+        // 重新绑定socket（可选，如果当前socket有问题）
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let local_addr = socket.local_addr()?;
+        self.socket = socket;
+
+        // 生成新的连接ID
+        let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+        ring::rand::SystemRandom::new().fill(&mut scid).unwrap();
+        let scid = ConnectionId::from_ref(&scid);
+
+        // 创建新的连接配置
+        let mut config = create_simple_config()?;
+        config.verify_peer(false);
+
+        // 建立新连接
+        self.conn = quiche::connect(None, &scid, local_addr, self.server_addr, &mut config)?;
+        
+        // 重置状态
+        self.next_stream_id = 4;
+        self.stream_buffers.clear();
+        self.last_activity = std::time::Instant::now();
+
+        // 完成握手
+        self.handshake().await?;
+        
+        info!("✅ 重连成功!");
+        Ok(())
+    }
+
+    /// 更新最后活动时间
+    fn update_activity(&mut self) {
+        self.last_activity = std::time::Instant::now();
+    }
+
+    /// 检查是否需要发送PING帧保活
+    fn should_send_ping(&self) -> bool {
+        // 在空闲超时时间的1/3后开始发送PING帧 (即100秒后)
+        self.last_activity.elapsed() > Duration::from_secs(100)
+    }
+
+    /// 发送QUIC标准的PING帧
+    async fn send_ping(&mut self) -> Result<()> {
+        if !self.is_connection_alive() {
+            return Err(anyhow!("连接已关闭"));
+        }
+
+        // 使用QUIC标准的ACK-eliciting包（包含PING帧）
+        match self.conn.send_ack_eliciting() {
+            Ok(_) => {
+                debug!("💓 发送QUIC PING帧");
+                let mut out = [0; config::MAX_DATAGRAM_SIZE];
+                self.send_pending_packets(&mut out).await?;
+                self.update_activity();
+                Ok(())
+            }
+            Err(e) => Err(anyhow!("PING发送失败: {e}"))
+        }
+    }
+
     /// 发送消息
     pub async fn send_message(&mut self, message: &str) -> Result<()> {
+        // 检查连接状态，如果连接已关闭则尝试重连
+        if !self.is_connection_alive() {
+            warn!("⚠️ 检测到连接已关闭，尝试重连...");
+            if let Err(e) = self.reconnect().await {
+                return Err(anyhow!("重连失败: {e}"));
+            }
+        }
+
         if !self.conn.is_established() {
             return Err(anyhow!("连接未建立"));
         }
@@ -185,6 +268,7 @@ impl SimpleQuicClient {
         }
 
         debug!("✅ 完整消息发送完成到流 {stream_id} ({} 字节)", message_bytes.len());
+        self.update_activity(); // 更新最后活动时间
         Ok(())
     }
 
@@ -197,11 +281,41 @@ impl SimpleQuicClient {
         let mut stdin_reader = BufReader::new(stdin());
         let mut buf = [0; config::MAX_DATAGRAM_SIZE];
         let mut out = [0; config::MAX_DATAGRAM_SIZE];
+        
+        // QUIC内部定时器，用于处理超时和保活
+        let mut quic_timer = tokio::time::interval(Duration::from_millis(100));
 
         loop {
             let mut line = String::new();
 
             tokio::select! {
+                // QUIC内部定时器 - 处理超时、重传、保活等
+                _ = quic_timer.tick() => {
+                    // 调用QUIC的超时处理
+                    self.conn.on_timeout();
+                    
+                    // 检查连接状态
+                    if !self.is_connection_alive() {
+                        if self.conn.is_draining() {
+                            warn!("⚠️ 连接正在关闭，尝试重连...");
+                        } else if self.conn.is_closed() {
+                            warn!("⚠️ 连接已关闭，尝试重连...");
+                        }
+                        if let Err(e) = self.reconnect().await {
+                            error!("❌ 重连失败: {e}");
+                            continue;
+                        }
+                    } else if self.should_send_ping() {
+                        // 发送QUIC标准的PING帧保活
+                        if let Err(e) = self.send_ping().await {
+                            debug!("💔 PING发送失败: {e}");
+                        }
+                    }
+                    
+                    // 发送待发送的数据包（包括PING、ACK等）
+                    let _ = self.send_pending_packets(&mut out).await;
+                }
+
                 // 处理终端输入
                 result = stdin_reader.read_line(&mut line) => {
                     match result {
@@ -241,6 +355,9 @@ impl SimpleQuicClient {
                                     error!("❌ 处理数据包失败: {e}");
                                     continue;
                                 }
+
+                                // 更新活动时间（收到服务端数据）
+                                self.update_activity();
 
                                 // 检查可读的流并立即打印
                                 for stream_id in self.conn.readable() {
