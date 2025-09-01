@@ -5,13 +5,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use env_logger::Env;
+use log::{debug, error, info, warn};
 use quiche::{Connection, ConnectionId};
 use ring::rand::SecureRandom;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::interval;
-use env_logger::Env;
-use log::{debug, error, info, warn};
 
 use quicduck::{config, create_simple_config, generate_cert_and_key_for_domain};
 
@@ -401,7 +401,6 @@ fn generate_test_cert_for_domain(domain: &str) -> Result<()> {
 async fn main() -> Result<()> {
     // 初始化日志系统，使用环境变量RUST_LOG控制日志级别，默认Info
     env_logger::init_from_env(Env::default().default_filter_or("info"));
-
 
     // 解析命令行参数
     let args = Args::parse();

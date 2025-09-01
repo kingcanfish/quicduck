@@ -4,13 +4,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use env_logger::Env;
+use log::{debug, error, info, warn};
 use quiche::{Connection, ConnectionId};
 use ring::rand::SecureRandom;
 use std::io::Write;
 use tokio::io::{stdin, AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
-use env_logger::Env;
-use log::{debug, error, info, warn};
 
 use quicduck::{config, create_simple_config};
 
@@ -29,7 +29,7 @@ pub struct SimpleQuicClient {
     conn: Connection,
     server_addr: SocketAddr,
     server_addr_str: String, // 保存服务器地址字符串用于重连
-    next_stream_id: u64, // 追踪下一个可用的流ID
+    next_stream_id: u64,     // 追踪下一个可用的流ID
     // 存储每个流的部分数据缓冲区
     stream_buffers: HashMap<u64, Vec<u8>>,
     last_activity: std::time::Instant, // 最后活动时间
@@ -157,7 +157,7 @@ impl SimpleQuicClient {
 
         // 建立新连接
         self.conn = quiche::connect(None, &scid, local_addr, self.server_addr, &mut config)?;
-        
+
         // 重置状态
         self.next_stream_id = 4;
         self.stream_buffers.clear();
@@ -165,7 +165,7 @@ impl SimpleQuicClient {
 
         // 完成握手
         self.handshake().await?;
-        
+
         info!("✅ 重连成功!");
         Ok(())
     }
@@ -196,7 +196,7 @@ impl SimpleQuicClient {
                 self.update_activity();
                 Ok(())
             }
-            Err(e) => Err(anyhow!("PING发送失败: {e}"))
+            Err(e) => Err(anyhow!("PING发送失败: {e}")),
         }
     }
 
@@ -238,12 +238,20 @@ impl SimpleQuicClient {
                 match self.conn.stream_send(stream_id, chunk, is_last) {
                     Ok(written) => {
                         if written == chunk.len() {
-                            debug!("📤 成功发送块 {}/{} 字节到流 {stream_id} (fin={})", 
-                                   sent + written, message_bytes.len(), is_last);
+                            debug!(
+                                "📤 成功发送块 {}/{} 字节到流 {stream_id} (fin={})",
+                                sent + written,
+                                message_bytes.len(),
+                                is_last
+                            );
                             break; // 成功发送完整块
                         } else {
                             // 部分发送，等待流控制窗口
-                            debug!("⚠️ 部分发送 {}/{} 字节，等待流控制窗口", written, chunk.len());
+                            debug!(
+                                "⚠️ 部分发送 {}/{} 字节，等待流控制窗口",
+                                written,
+                                chunk.len()
+                            );
                             let mut out = [0; config::MAX_DATAGRAM_SIZE];
                             self.send_pending_packets(&mut out).await?;
                             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -267,7 +275,10 @@ impl SimpleQuicClient {
             self.send_pending_packets(&mut out).await?;
         }
 
-        debug!("✅ 完整消息发送完成到流 {stream_id} ({} 字节)", message_bytes.len());
+        debug!(
+            "✅ 完整消息发送完成到流 {stream_id} ({} 字节)",
+            message_bytes.len()
+        );
         self.update_activity(); // 更新最后活动时间
         Ok(())
     }
@@ -281,7 +292,7 @@ impl SimpleQuicClient {
         let mut stdin_reader = BufReader::new(stdin());
         let mut buf = [0; config::MAX_DATAGRAM_SIZE];
         let mut out = [0; config::MAX_DATAGRAM_SIZE];
-        
+
         // QUIC内部定时器，用于处理超时和保活
         let mut quic_timer = tokio::time::interval(Duration::from_millis(100));
 
@@ -293,7 +304,7 @@ impl SimpleQuicClient {
                 _ = quic_timer.tick() => {
                     // 调用QUIC的超时处理
                     self.conn.on_timeout();
-                    
+
                     // 检查连接状态
                     if !self.is_connection_alive() {
                         if self.conn.is_draining() {
@@ -311,7 +322,7 @@ impl SimpleQuicClient {
                             debug!("💔 PING发送失败: {e}");
                         }
                     }
-                    
+
                     // 发送待发送的数据包（包括PING、ACK等）
                     let _ = self.send_pending_packets(&mut out).await;
                 }
@@ -428,7 +439,7 @@ impl SimpleQuicClient {
 
         // 流未结束，返回空字符串等待后续数据
         Ok(String::new())
-     }
+    }
 
     /// 发送待发送的数据包
     async fn send_pending_packets(&mut self, out: &mut [u8]) -> Result<()> {
