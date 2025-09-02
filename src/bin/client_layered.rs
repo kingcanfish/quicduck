@@ -225,7 +225,7 @@ impl QuicLayer {
                 _ = quic_timer.tick() => {
                     self.conn.on_timeout();
                     self.send_pending_packets(&mut out).await?;
-                    
+
                     // 检查是否需要发送保活包
                     if self.should_send_ping() {
                         if let Err(e) = self.send_ping(&mut out).await {
@@ -279,19 +279,25 @@ impl QuicLayer {
     }
 
     /// 处理接收到的数据包
-    async fn handle_incoming_packet(&mut self, data: &[u8], from: SocketAddr, to: SocketAddr) -> Result<()> {
+    async fn handle_incoming_packet(
+        &mut self,
+        data: &[u8],
+        from: SocketAddr,
+        to: SocketAddr,
+    ) -> Result<()> {
         // 处理QUIC数据包，使用正确的本地地址
         let mut data_copy = data.to_vec();
-        self.conn.recv(&mut data_copy, quiche::RecvInfo { to, from })?;
+        self.conn
+            .recv(&mut data_copy, quiche::RecvInfo { to, from })?;
         self.last_activity = std::time::Instant::now();
 
         // 检查可读的流
         for stream_id in self.conn.readable() {
             if let Ok(message) = self.read_stream_data(stream_id) {
                 if !message.is_empty() {
-                    let _ = self.to_app_tx.send(QuicToAppMessage::MessageReceived {
-                        content: message,
-                    });
+                    let _ = self
+                        .to_app_tx
+                        .send(QuicToAppMessage::MessageReceived { content: message });
                 }
             }
         }
@@ -329,9 +335,7 @@ impl QuicLayer {
         let mut stream_finished = false;
 
         // 确保流缓冲区存在
-        if !self.stream_buffers.contains_key(&stream_id) {
-            self.stream_buffers.insert(stream_id, Vec::new());
-        }
+        self.stream_buffers.entry(stream_id).or_default();
 
         loop {
             let mut stream_buf = vec![0; 1024];
@@ -443,8 +447,8 @@ impl UdpLayer {
                 result = self.socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, from)) => {
-                            debug!("🌐 UDP层收到 {} 字节数据包，来自 {}", len, from);
-                            
+                            debug!("🌐 UDP层收到 {len} 字节数据包，来自 {from}");
+
                             // 发送到QUIC层，包含正确的本地地址
                             let local_addr = self.socket.local_addr().unwrap_or_else(|_| {
                                 SocketAddr::from(([127, 0, 0, 1], 0))
@@ -466,7 +470,7 @@ impl UdpLayer {
                     match msg {
                         Some(QuicToUdpMessage { data, to }) => {
                             debug!("🌐 UDP层发送 {} 字节数据包到 {}", data.len(), to);
-                            
+
                             if let Err(e) = self.socket.send_to(&data, to).await {
                                 error!("❌ UDP发送失败: {e}");
                             }
