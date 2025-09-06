@@ -43,3 +43,6 @@ perf.data*
 
 # 文档构建输出
 /doc/
+
+.roo/
+.claude/
